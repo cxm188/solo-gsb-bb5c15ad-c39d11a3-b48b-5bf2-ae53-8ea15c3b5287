@@ -1526,3 +1526,360 @@ def test_audit_existing_endpoints_unchanged():
     )
     assert resp.status_code == 200
     assert post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}]).status_code == 200
+
+
+# ---------- /firewall/simulate ----------
+
+def post_firewall(payload):
+    return client.post("/firewall/simulate", json=payload)
+
+
+FW_RULES = [
+    {"action": "allow", "src_cidr": "10.0.0.0/24", "dst_cidr": "10.0.1.0/24",
+     "protocol": "tcp", "port_min": 80, "port_max": 80},
+    {"action": "deny", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+     "protocol": "tcp", "port_min": 0, "port_max": 65535},
+]
+
+
+def fw_event(time, src, sp, dst, dp, protocol="tcp"):
+    return {"time": time, "src_ip": src, "src_port": sp,
+            "dst_ip": dst, "dst_port": dp, "protocol": protocol}
+
+
+def fw_payload(events, rules=None, default_action="deny", session_timeout=30):
+    return {
+        "rules": FW_RULES if rules is None else rules,
+        "default_action": default_action,
+        "events": events,
+        "session_timeout": session_timeout,
+    }
+
+
+def test_firewall_allow_stateful_expiry_full_flow():
+    events = [
+        fw_event(1, "10.0.0.1", 1234, "10.0.1.1", 80),
+        fw_event(2, "10.0.1.1", 80, "10.0.0.1", 1234),
+        fw_event(31, "10.0.1.1", 80, "10.0.0.1", 1234),
+        fw_event(32, "10.0.1.1", 80, "10.0.0.1", 1234),
+        fw_event(40, "10.0.0.1", 1234, "10.0.1.1", 80),
+        fw_event(75, "10.0.0.1", 1234, "10.0.1.1", 80),
+        fw_event(76, "10.0.1.1", 80, "10.0.0.1", 1234),
+        fw_event(77, "10.0.0.9", 5555, "10.0.1.1", 22),
+    ]
+    resp = post_firewall(fw_payload(events))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["rule_count"] == 2
+    assert body["event_count"] == 8
+    assert body["session_timeout"] == 30
+    assert body["default_action"] == "deny"
+
+    results = body["results"]
+    assert [(r["index"], r["time"]) for r in results] == [
+        (i, events[i]["time"]) for i in range(8)
+    ]
+    # 0: 正向 allow 建会话
+    assert results[0]["decision"] == "rule"
+    assert results[0]["rule_index"] == 0
+    assert results[0]["action"] == "allow"
+    assert results[0]["direction"] == "forward"
+    assert results[0]["session_state"] == "new"
+    assert results[0]["session"] == {
+        "key": "tcp 10.0.0.1:1234 -> 10.0.1.1:80",
+        "rule_index": 0,
+        "created_at": 1,
+        "last_seen_at": 1,
+        "expires_at": 31,
+        "age": 0,
+        "established_by_event": 0,
+    }
+    assert results[0]["expired_sessions"] == []
+
+    # 1/2: 反向 stateful（t=31 恰为 expires_at，仍存活）
+    for i, age in ((1, 1), (2, 30)):
+        assert results[i]["decision"] == "stateful"
+        assert results[i]["rule_index"] == 0
+        assert results[i]["action"] == "allow"
+        assert results[i]["direction"] == "reverse"
+        assert results[i]["session_state"] == "established"
+        assert results[i]["session"]["age"] == age
+    assert results[2]["session"]["last_seen_at"] == 31
+
+    # 3: 反向超时 -> 清除过期会话后重新走规则 -> deny-all
+    assert results[3]["decision"] == "rule"
+    assert results[3]["rule_index"] == 1
+    assert results[3]["action"] == "deny"
+    assert results[3]["direction"] == "forward"
+    assert results[3]["session_state"] == "expired"
+    assert results[3]["session"] is None
+    assert results[3]["expired_sessions"] == [{
+        "key": "tcp 10.0.0.1:1234 -> 10.0.1.1:80",
+        "rule_index": 0,
+        "created_at": 1,
+        "last_seen_at": 31,
+        "expires_at": 31,
+        "established_by_event": 0,
+    }]
+
+    # 4: 正向重新 allow，重建会话
+    assert results[4]["decision"] == "rule"
+    assert results[4]["session_state"] == "new"
+    assert results[4]["session"]["created_at"] == 40
+    assert results[4]["session"]["expires_at"] == 70
+
+    # 5: 同方向但已过期 -> 惰性清除并重建
+    assert results[5]["session_state"] == "new"
+    assert len(results[5]["expired_sessions"]) == 1
+    assert results[5]["expired_sessions"][0]["expires_at"] == 70
+
+    # 6: 新会话的反向 stateful
+    assert results[6]["decision"] == "stateful"
+    assert results[6]["direction"] == "reverse"
+
+    # 7: 端口 22 不匹配 allow，被 deny-all 拒绝
+    assert results[7]["decision"] == "rule"
+    assert results[7]["rule_index"] == 1
+    assert results[7]["action"] == "deny"
+    assert results[7]["session_state"] == "none"
+
+    assert body["summary"] == {
+        "allow": 6,
+        "deny": 2,
+        "sessions_new": 3,
+        "sessions_expired": 2,
+        "active_sessions": 1,
+    }
+
+
+def test_firewall_default_action_and_empty_rules():
+    payload = fw_payload(
+        [fw_event(0, "8.8.8.8", 1, "9.9.9.9", 1),
+         fw_event(1, "9.9.9.9", 1, "8.8.8.8", 1)],
+        rules=[],
+        default_action="ALLOW",
+    )
+    resp = post_firewall(payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["default_action"] == "allow"
+    # 默认 allow 不建立会话：反向也不走 stateful
+    assert [r["decision"] for r in body["results"]] == ["default", "default"]
+    assert all(r["session"] is None for r in body["results"])
+    assert body["summary"] == {
+        "allow": 2, "deny": 0, "sessions_new": 0,
+        "sessions_expired": 0, "active_sessions": 0,
+    }
+
+
+def test_firewall_icmp_and_protocol_case_insensitive():
+    payload = {
+        "rules": [
+            {"action": "Allow", "src_cidr": "10.0.0.0/24", "dst_cidr": "10.0.1.0/24",
+             "protocol": "ICMP", "port_min": None, "port_max": None}
+        ],
+        "default_action": "deny",
+        "events": [
+            fw_event(0, "10.0.0.1", None, "10.0.1.9", None, "icmp"),
+            fw_event(1, "10.0.1.9", None, "10.0.0.1", None, "icmp"),
+            fw_event(2, "10.0.2.9", None, "10.0.1.9", None, "icmp"),
+        ],
+    }
+    resp = post_firewall(payload)
+    assert resp.status_code == 200
+    results = resp.json()["results"]
+    assert [(r["decision"], r["action"], r["direction"], r["session_state"]) for r in results] == [
+        ("rule", "allow", "forward", "new"),
+        ("stateful", "allow", "reverse", "established"),
+        ("default", "deny", "forward", "none"),
+    ]
+    assert results[0]["session"]["key"] == "icmp 10.0.0.1 -> 10.0.1.9"
+
+
+def test_firewall_equal_timestamps_allowed():
+    payload = fw_payload([
+        fw_event(5, "10.0.0.1", 1, "10.0.1.1", 80),
+        fw_event(5, "10.0.0.2", 2, "10.0.1.1", 80),
+    ])
+    resp = post_firewall(payload)
+    assert resp.status_code == 200
+    assert resp.json()["summary"]["sessions_new"] == 2
+
+
+def test_firewall_time_out_of_order_422_lists_all_violations():
+    payload = fw_payload([
+        fw_event(10, "10.0.0.1", 1, "10.0.1.1", 80),
+        fw_event(5, "10.0.0.1", 1, "10.0.1.1", 80),
+        fw_event(5, "10.0.0.2", 2, "10.0.1.1", 80),
+        fw_event(4, "10.0.0.2", 2, "10.0.1.1", 80),
+    ])
+    resp = post_firewall(payload)
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {
+        "error": "time_out_of_order",
+        "violations": [
+            {"index": 1, "time": 5, "previous_index": 0, "previous_time": 10},
+            {"index": 3, "time": 4, "previous_index": 2, "previous_time": 5},
+        ],
+    }
+
+
+def test_firewall_duplicate_session_key_422():
+    payload = fw_payload([
+        fw_event(1, "10.0.0.1", 1234, "10.0.1.1", 80),
+        fw_event(2, "10.0.0.1", 1234, "10.0.1.1", 80),
+    ])
+    resp = post_firewall(payload)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "duplicate_session_key"
+    assert detail["conflicts"] == [
+        {
+            "index": 1,
+            "key": "tcp 10.0.0.1:1234 -> 10.0.1.1:80",
+            "rule_index": 0,
+            "existing": {
+                "rule_index": 0,
+                "created_at": 1,
+                "last_seen_at": 1,
+                "established_by_event": 0,
+            },
+        }
+    ]
+    # 重叠会话键不产生部分结果
+    assert "results" not in resp.json()
+
+
+def test_firewall_invalid_ports_422():
+    # 事件目的端口越界 / 非整数 / bool / float
+    for bad_port in [65536, -1, "80", True, 1.5]:
+        payload = fw_payload([
+            fw_event(0, "10.0.0.1", 1, "10.0.1.1", bad_port)
+        ])
+        assert post_firewall(payload).status_code == 422, bad_port
+
+    # icmp 事件携带端口
+    payload = fw_payload(
+        [fw_event(0, "10.0.0.1", 0, "10.0.1.1", None, "icmp")],
+        rules=[{"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+                "protocol": "icmp", "port_min": None, "port_max": None}],
+    )
+    assert post_firewall(payload).status_code == 422
+
+    # icmp 规则携带端口范围
+    bad_rule = {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+                "protocol": "icmp", "port_min": 0, "port_max": 0}
+    assert post_firewall(fw_payload(
+        [fw_event(0, "10.0.0.1", None, "10.0.1.1", None, "icmp")], rules=[bad_rule]
+    )).status_code == 422
+
+    # tcp 规则缺少端口 / port_min > port_max
+    for bad_rule in [
+        {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+         "protocol": "tcp", "port_min": None, "port_max": 80},
+        {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+         "protocol": "tcp", "port_min": 100, "port_max": 80},
+        {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+         "protocol": "tcp", "port_min": 70000, "port_max": 70001},
+    ]:
+        assert post_firewall(fw_payload(
+            [fw_event(0, "10.0.0.1", 1, "10.0.1.1", 80)], rules=[bad_rule]
+        )).status_code == 422
+
+
+def test_firewall_validation_422():
+    # 缺少字段 / 请求体为空
+    assert post_firewall({}).status_code == 422
+    assert post_firewall({"rules": [], "events": []}).status_code == 422  # 缺 default_action
+    assert post_firewall({"rules": [], "default_action": "deny"}).status_code == 422  # 缺 events
+
+    # 非法 default_action / action / protocol
+    assert post_firewall(fw_payload(
+        [fw_event(0, "10.0.0.1", 1, "10.0.1.1", 80)], default_action="permit"
+    )).status_code == 422
+    bad_action_rule = {"action": "permit", "src_cidr": "0.0.0.0/0",
+                       "dst_cidr": "0.0.0.0/0", "protocol": "tcp",
+                       "port_min": 0, "port_max": 65535}
+    assert post_firewall(fw_payload(
+        [fw_event(0, "10.0.0.1", 1, "10.0.1.1", 80)], rules=[bad_action_rule]
+    )).status_code == 422
+    assert post_firewall(fw_payload(
+        [fw_event(0, "10.0.0.1", 1, "10.0.1.1", 80, "sctp")]
+    )).status_code == 422
+
+    # 非法 CIDR / 地址 / IPv6（沿用现有严格校验）
+    for bad_cidr in ["10.0.0.0/33", "10.0.0.1/24", "2001:db8::/32", "garbage"]:
+        rule = {"action": "allow", "src_cidr": bad_cidr, "dst_cidr": "0.0.0.0/0",
+                "protocol": "tcp", "port_min": 0, "port_max": 65535}
+        assert post_firewall(fw_payload(
+            [fw_event(0, "10.0.0.1", 1, "10.0.1.1", 80)], rules=[rule]
+        )).status_code == 422, bad_cidr
+    for bad_ip in ["10.0.0.1/32", "::1", "010.0.0.1", "999.0.0.1", ""]:
+        assert post_firewall(fw_payload(
+            [fw_event(0, bad_ip, 1, "10.0.1.1", 80)]
+        )).status_code == 422, bad_ip
+
+    # 负时间戳 / 非整数时间 / 非法 session_timeout
+    assert post_firewall(fw_payload(
+        [fw_event(-1, "10.0.0.1", 1, "10.0.1.1", 80)]
+    )).status_code == 422
+    assert post_firewall(fw_payload(
+        [fw_event(0, "10.0.0.1", 1, "10.0.1.1", 80)], session_timeout=0
+    )).status_code == 422
+    assert post_firewall(fw_payload(
+        [fw_event(0, "10.0.0.1", 1, "10.0.1.1", 80)], session_timeout=86401
+    )).status_code == 422
+
+    # 空事件列表 / 规则数超限
+    assert post_firewall(fw_payload([])).status_code == 422
+    too_many_rules = [
+        {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+         "protocol": "tcp", "port_min": 0, "port_max": 65535}
+        for _ in range(501)
+    ]
+    assert post_firewall(fw_payload(
+        [fw_event(0, "10.0.0.1", 1, "10.0.1.1", 80)], rules=too_many_rules
+    )).status_code == 422
+
+
+def test_firewall_default_session_timeout_30():
+    payload = {
+        "rules": FW_RULES,
+        "default_action": "deny",
+        "events": [fw_event(0, "10.0.0.1", 1, "10.0.1.1", 80)],
+    }
+    resp = post_firewall(payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["session_timeout"] == 30
+    assert body["results"][0]["session"]["expires_at"] == 30
+
+
+def test_firewall_openapi_documented():
+    spec = client.get("/openapi.json").json()
+    assert "/firewall/simulate" in spec["paths"]
+    operation = spec["paths"]["/firewall/simulate"]["post"]
+    assert operation["tags"] == ["firewall"]
+    for schema in (
+        "FirewallSimulateRequest",
+        "FirewallSimulateResponse",
+        "FirewallRule",
+        "PacketEvent",
+        "FirewallEventResult",
+        "FirewallSummary",
+        "SessionInfo",
+    ):
+        assert schema in spec["components"]["schemas"], schema
+    examples = operation["requestBody"]["content"]["application/json"]["examples"]
+    assert "stateful" in examples
+    err_examples = operation["responses"]["422"]["content"]["application/json"]["examples"]
+    assert "time_out_of_order" in err_examples
+    assert "duplicate_session_key" in err_examples
+
+
+def test_firewall_existing_endpoints_unchanged():
+    # 新接口不影响既有接口
+    assert client.get("/health").status_code == 200
+    assert client.get("/").status_code == 200
+    assert post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}]).status_code == 200
+    assert post_audit([]).status_code == 200

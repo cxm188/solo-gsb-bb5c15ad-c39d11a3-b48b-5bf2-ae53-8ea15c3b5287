@@ -4,7 +4,14 @@ from __future__ import annotations
 from typing import Literal
 
 from fastapi import Body, FastAPI, HTTPException
-from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from .analyzer import (
     CIDR_DIFF_MAX_ENTRIES,
@@ -18,6 +25,19 @@ from .analyzer import (
     diff_cidr_lists,
     explain_query,
     parse_cidr_v4,
+)
+from .firewall import (
+    DEFAULT_SESSION_TIMEOUT,
+    FIREWALL_EVENTS_MAX,
+    FIREWALL_RULES_MAX,
+    ICMP,
+    SESSION_TIMEOUT_MAX,
+    SESSION_TIMEOUT_MIN,
+    DuplicateSessionKeyError,
+    FirewallTimeOrderError,
+    InvalidPortError,
+    InvalidProtocolError,
+    simulate_firewall,
 )
 from .router import (
     FAILED_NEXT_HOPS_MAX,
@@ -49,9 +69,11 @@ app = FastAPI(
         "失效后的路由切换影响（before/after/impact），或通过 /routes/audit "
         "把最长前缀优先、同前缀最低 metric 与 ECMP 语义应用到整个 IPv4 空间，"
         "计算每条路由实际负责的地址集合（active/partial/shadowed、生效地址数"
-        "与无损最少 CIDR）。"
+        "与无损最少 CIDR），或通过 /firewall/simulate 在有序五元组规则之上"
+        "模拟有状态防火墙：首个正向 allow 建立会话、存活期内反向包自动 "
+        "stateful 放行、超时后重新走规则匹配。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -630,6 +652,242 @@ class RouteAuditResponse(BaseModel):
         ..., description="逐条路由审计结果，严格保持 routes 输入顺序"
     )
     summary: RouteAuditSummary
+
+
+# ---------- /firewall/simulate ----------
+
+
+class FirewallRule(BaseModel):
+    """单条有状态防火墙规则：动作 + 源/目的 IPv4 CIDR + 协议 + 目的端口范围。"""
+
+    action: Literal["allow", "deny"] = Field(
+        ..., description="动作，仅允许 allow 或 deny（大小写不敏感）"
+    )
+    src_cidr: str = Field(..., description="源 IPv4 CIDR；纯 IP 按 /32 处理；禁止 IPv6")
+    dst_cidr: str = Field(..., description="目的 IPv4 CIDR；纯 IP 按 /32 处理；禁止 IPv6")
+    protocol: Literal["tcp", "udp", "icmp"] = Field(
+        ..., description="传输层协议，仅允许 tcp / udp / icmp（大小写不敏感）"
+    )
+    port_min: int | None = Field(
+        ...,
+        ge=0,
+        le=65535,
+        strict=True,
+        description="目的端口范围下界（含），0～65535；icmp 规则必须为 null",
+    )
+    port_max: int | None = Field(
+        ...,
+        ge=0,
+        le=65535,
+        strict=True,
+        description="目的端口范围上界（含），0～65535 且不小于 port_min；icmp 规则必须为 null",
+    )
+
+    @field_validator("action", "protocol", mode="before")
+    @classmethod
+    def normalize_lower(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @field_validator("src_cidr")
+    @classmethod
+    def validate_src_cidr(cls, value: str) -> str:
+        # 校验并规范化；非法 CIDR / IPv6 抛出 ValueError -> 422
+        return parse_cidr_v4(value)[2]
+
+    @field_validator("dst_cidr")
+    @classmethod
+    def validate_dst_cidr(cls, value: str) -> str:
+        return parse_cidr_v4(value)[2]
+
+    @model_validator(mode="after")
+    def validate_ports_by_protocol(self) -> "FirewallRule":
+        # 跨字段：icmp 不允许端口；tcp/udp 必须同时给出且 port_min <= port_max
+        if self.protocol == ICMP:
+            if self.port_min is not None or self.port_max is not None:
+                raise ValueError("icmp 规则不允许携带端口范围（port_min/port_max 必须为 null）")
+        else:
+            if self.port_min is None or self.port_max is None:
+                raise ValueError(
+                    f"{self.protocol} 规则必须同时给出 port_min 与 port_max"
+                )
+            if self.port_min > self.port_max:
+                raise ValueError(
+                    f"port_min 不能大于 port_max：{self.port_min} > {self.port_max}"
+                )
+        return self
+
+
+class PacketEvent(BaseModel):
+    """单个数据包事件：时间戳 + 五元组（icmp 无端口）。"""
+
+    time: int = Field(
+        ...,
+        ge=0,
+        strict=True,
+        description="事件时间戳（非负整数，单位与 session_timeout 一致，API 约定为秒）；"
+        "全请求必须非严格递增（相等时间戳合法）",
+    )
+    src_ip: str = Field(..., description="源 IPv4 地址（纯地址，禁止 CIDR 写法与 IPv6）")
+    src_port: int | None = Field(
+        ..., ge=0, le=65535, strict=True,
+        description="源端口 0～65535；icmp 事件必须为 null",
+    )
+    dst_ip: str = Field(..., description="目的 IPv4 地址（纯地址，禁止 CIDR 写法与 IPv6）")
+    dst_port: int | None = Field(
+        ..., ge=0, le=65535, strict=True,
+        description="目的端口 0～65535；icmp 事件必须为 null",
+    )
+    protocol: Literal["tcp", "udp", "icmp"] = Field(
+        ..., description="传输层协议，仅允许 tcp / udp / icmp（大小写不敏感）"
+    )
+
+    @field_validator("protocol", mode="before")
+    @classmethod
+    def normalize_protocol(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @field_validator("src_ip")
+    @classmethod
+    def validate_src_ip(cls, value: str) -> str:
+        # 严格 IPv4 地址；CIDR 写法 / 前导零 / IPv6 抛出 ValueError -> 422
+        return parse_address_v4(value)[1]
+
+    @field_validator("dst_ip")
+    @classmethod
+    def validate_dst_ip(cls, value: str) -> str:
+        return parse_address_v4(value)[1]
+
+    @model_validator(mode="after")
+    def validate_ports_by_protocol(self) -> "PacketEvent":
+        # 跨字段：icmp 不允许端口；tcp/udp 必须同时给出两端口
+        if self.protocol == ICMP:
+            if self.src_port is not None or self.dst_port is not None:
+                raise ValueError("icmp 事件不允许携带端口（src_port/dst_port 必须为 null）")
+        elif self.src_port is None or self.dst_port is None:
+            raise ValueError(f"{self.protocol} 事件必须同时给出 src_port 与 dst_port")
+        return self
+
+
+class FirewallSimulateRequest(BaseModel):
+    """有状态防火墙模拟请求：有序规则 + 按时间排序的事件 + 会话存活时间。"""
+
+    rules: list[FirewallRule] = Field(
+        ...,
+        max_length=FIREWALL_RULES_MAX,
+        description="有序规则列表（按数组顺序逐条匹配，首条命中生效），允许为空 []",
+    )
+    default_action: Literal["allow", "deny"] = Field(
+        ..., description="未命中任何规则时的默认动作（大小写不敏感）"
+    )
+    events: list[PacketEvent] = Field(
+        ...,
+        min_length=1,
+        max_length=FIREWALL_EVENTS_MAX,
+        description="按时间非严格递增排序的数据包事件（1～2000 个）；逆序时间返回 422",
+    )
+    session_timeout: int = Field(
+        default=DEFAULT_SESSION_TIMEOUT,
+        ge=SESSION_TIMEOUT_MIN,
+        le=SESSION_TIMEOUT_MAX,
+        strict=True,
+        description=(
+            "会话存活时间（正整数，单位与事件 time 一致，API 约定为秒，"
+            f"默认 {DEFAULT_SESSION_TIMEOUT}）；会话在 created_at + session_timeout "
+            "时刻仍存活，之后到达的包必须重新走规则匹配"
+        ),
+    )
+
+    @field_validator("default_action", mode="before")
+    @classmethod
+    def normalize_default_action(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+class SessionInfo(BaseModel):
+    key: str = Field(..., description="会话正向五元组的可读表示，如 tcp 10.0.0.1:1234 -> 10.0.0.2:80")
+    rule_index: int = Field(..., description="建立该会话所命中的 allow 规则序号（从 0 开始）")
+    created_at: int = Field(..., description="会话建立时刻（首个正向 allow 事件的 time）")
+    last_seen_at: int = Field(..., description="最近一次（含建立）命中该会话的事件时间")
+    expires_at: int = Field(..., description="会话存活截止时刻（created_at + session_timeout，含）")
+    age: int = Field(..., description="当前事件时间相对 created_at 的间隔（time - created_at）")
+    established_by_event: int = Field(..., description="建立会话的事件序号（从 0 开始）")
+
+
+class ExpiredSessionInfo(BaseModel):
+    key: str = Field(..., description="被清除的过期会话五元组")
+    rule_index: int
+    created_at: int
+    last_seen_at: int
+    expires_at: int
+    established_by_event: int
+
+
+class FirewallEventResult(BaseModel):
+    index: int = Field(..., description="事件在输入中的序号（从 0 开始）")
+    time: int
+    src_ip: str = Field(..., description="规范化后的源 IPv4 地址")
+    src_port: int | None
+    dst_ip: str = Field(..., description="规范化后的目的 IPv4 地址")
+    dst_port: int | None
+    protocol: Literal["tcp", "udp", "icmp"]
+    decision: Literal["rule", "default", "stateful"] = Field(
+        ...,
+        description=(
+            "裁决来源：rule 命中规则；default 未命中任何规则走默认动作；"
+            "stateful 命中存活会话的反向包，自动放行"
+        ),
+    )
+    rule_index: int | None = Field(
+        ...,
+        description="命中规则的序号（stateful 反向包回填其建会话规则；default 为 null）",
+    )
+    action: Literal["allow", "deny"] = Field(..., description="最终动作")
+    direction: Literal["forward", "reverse"] = Field(
+        ...,
+        description="包方向：forward 走规则/默认裁决；reverse 命中存活会话的反向包",
+    )
+    session_state: Literal["new", "established", "expired", "none"] = Field(
+        ...,
+        description=(
+            "会话状态：new 本事件新建会话；established 命中存活会话（stateful）；"
+            "expired 本事件碰到并清除了过期会话且未重建；none 不涉及会话"
+        ),
+    )
+    session: SessionInfo | None = Field(
+        ..., description="本事件命中 / 新建的会话描述；拒绝或走默认动作时为 null"
+    )
+    expired_sessions: list[ExpiredSessionInfo] = Field(
+        ..., description="本事件处理过程中惰性清除的过期会话（可能为 0～2 个）"
+    )
+
+
+class FirewallSummary(BaseModel):
+    allow: int = Field(..., description="最终放行的事件数（含规则 allow、默认 allow 与 stateful）")
+    deny: int = Field(..., description="最终拒绝的事件数；allow + deny = event_count")
+    sessions_new: int = Field(..., description="新建会话次数（正向 allow 建会话，含超时重建）")
+    sessions_expired: int = Field(
+        ..., description="被惰性清除的过期会话数（事件实际碰到已超时会话时计数）"
+    )
+    active_sessions: int = Field(
+        ..., description="请求结束（最后一个事件时间）时仍存活的会话数"
+    )
+
+
+class FirewallSimulateResponse(BaseModel):
+    rule_count: int
+    event_count: int
+    session_timeout: int
+    default_action: Literal["allow", "deny"]
+    results: list[FirewallEventResult] = Field(
+        ..., description="逐事件裁决结果，严格保持 events 输入顺序"
+    )
+    summary: FirewallSummary
 
 
 @app.get("/", tags=["meta"])
@@ -1234,3 +1492,180 @@ def routes_audit(
     return audit_routes(
         [(route.cidr, route.next_hop, route.metric) for route in request.routes]
     )
+
+
+# ---------- /firewall/simulate ----------
+
+
+@app.post(
+    "/firewall/simulate",
+    response_model=FirewallSimulateResponse,
+    tags=["firewall"],
+    summary="有状态防火墙模拟：有序五元组规则 + 会话建立、反向放行与超时重匹配",
+    responses={
+        422: {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "time_out_of_order": {
+                            "summary": "事件时间逆序",
+                            "value": {
+                                "detail": {
+                                    "error": "time_out_of_order",
+                                    "violations": [
+                                        {
+                                            "index": 2,
+                                            "time": 5,
+                                            "previous_index": 1,
+                                            "previous_time": 10,
+                                        }
+                                    ],
+                                }
+                            },
+                        },
+                        "duplicate_session_key": {
+                            "summary": "存活五元组重复建会话（重叠会话键）",
+                            "value": {
+                                "detail": {
+                                    "error": "duplicate_session_key",
+                                    "conflicts": [
+                                        {
+                                            "index": 2,
+                                            "key": "tcp 10.0.0.1:1234 -> 10.0.0.2:80",
+                                            "rule_index": 0,
+                                            "existing": {
+                                                "rule_index": 0,
+                                                "created_at": 1,
+                                                "last_seen_at": 1,
+                                                "established_by_event": 0,
+                                            },
+                                        }
+                                    ],
+                                }
+                            },
+                        },
+                    }
+                }
+            }
+        }
+    },
+)
+def firewall_simulate(
+    request: FirewallSimulateRequest = Body(
+        ...,
+        openapi_examples={
+            "stateful": {
+                "summary": "正向 allow 建会话、反向 stateful 放行、超时后重匹配",
+                "value": {
+                    "rules": [
+                        {
+                            "action": "allow",
+                            "src_cidr": "10.0.0.0/24",
+                            "dst_cidr": "10.0.1.0/24",
+                            "protocol": "tcp",
+                            "port_min": 80,
+                            "port_max": 80,
+                        },
+                        {
+                            "action": "deny",
+                            "src_cidr": "0.0.0.0/0",
+                            "dst_cidr": "0.0.0.0/0",
+                            "protocol": "tcp",
+                            "port_min": 0,
+                            "port_max": 65535,
+                        },
+                    ],
+                    "default_action": "deny",
+                    "session_timeout": 30,
+                    "events": [
+                        {"time": 1, "src_ip": "10.0.0.1", "src_port": 1234,
+                         "dst_ip": "10.0.1.1", "dst_port": 80, "protocol": "tcp"},
+                        {"time": 2, "src_ip": "10.0.1.1", "src_port": 80,
+                         "dst_ip": "10.0.0.1", "dst_port": 1234, "protocol": "tcp"},
+                        {"time": 35, "src_ip": "10.0.1.1", "src_port": 80,
+                         "dst_ip": "10.0.0.1", "dst_port": 1234, "protocol": "tcp"},
+                    ],
+                },
+            }
+        },
+    ),
+) -> dict:
+    """在**有序五元组规则**之上模拟有状态防火墙，逐事件给出裁决。
+
+    处理规则：
+
+    1. 规则按数组顺序逐条匹配，**首条命中生效**；匹配条件为协议相同、
+       源地址 ∈ `src_cidr`、目的地址 ∈ `dst_cidr`，tcp/udp 还要求
+       **目的端口**落在 `[port_min, port_max]`（源端口不参与匹配）；
+       均未命中时走 `default_action`。
+    2. 首个**正向**命中 allow 规则的包以其五元组建立会话，会话存活至
+       `created_at + session_timeout`（该时刻仍存活）。
+    3. 后续**反向包**（源/目的地址与端口整体交换、协议相同）在存活期内
+       **跳过规则匹配直接放行**：`decision = "stateful"`、`action = "allow"`、
+       `direction = "reverse"`，并刷新会话的 `last_seen_at`。
+    4. 反向包到达时会话**已超时**，则先清除该过期会话（计入
+       `sessions_expired`，挂在该事件的 `expired_sessions` 中），**重新走
+       规则匹配**：再次命中 allow 则按当前方向重建会话（`session_state =
+       "new"`），否则按命中规则 / 默认动作裁决（`session_state = "expired"`）。
+    5. 存活期间的**同方向（正向）包不享受状态化放行**，仍走规则匹配；若它
+       再次命中 allow 并试图为一个**仍存活**的同五元组建会话，视为
+       **重叠会话键**，返回 **422**；超时后的同五元组允许重建。
+
+    `results` **严格保持 events 输入顺序**；`summary` 汇总
+    `allow` / `deny` / `sessions_new` / `sessions_expired` 与请求结束时仍
+    存活的 `active_sessions`。
+
+    校验（均 **422**）：事件 `time` 必须**非严格递增**（相等时间戳合法，
+    逆序时 `detail.violations` 一次性列出全部逆序位置）；端口必须是
+    0～65535 的整数且 icmp 不得携带端口、tcp/udp 必须同时给出；
+    `port_min ≤ port_max`；重叠会话键在 `detail.conflicts` 中列出冲突事件、
+    五元组与仍存活的旧会话；CIDR / 地址沿用现有严格 IPv4 校验（禁止 IPv6、
+    前导零与 CIDR 写法的地址）。
+    """
+    try:
+        return simulate_firewall(
+            [
+                (
+                    rule.action,
+                    rule.src_cidr,
+                    rule.dst_cidr,
+                    rule.protocol,
+                    rule.port_min,
+                    rule.port_max,
+                )
+                for rule in request.rules
+            ],
+            request.default_action,
+            [
+                (
+                    event.time,
+                    event.src_ip,
+                    event.src_port,
+                    event.dst_ip,
+                    event.dst_port,
+                    event.protocol,
+                )
+                for event in request.events
+            ],
+            request.session_timeout,
+        )
+    except FirewallTimeOrderError as exc:
+        # 时间逆序：422 并一次性列出全部逆序位置
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "time_out_of_order", "violations": exc.violations},
+        ) from exc
+    except DuplicateSessionKeyError as exc:
+        # 存活五元组重复建会话：422 并列出冲突事件与旧会话
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "duplicate_session_key", "conflicts": exc.conflicts},
+        ) from exc
+    except (
+        InvalidCIDRError,
+        InvalidIPv4AddressError,
+        InvalidPortError,
+        InvalidProtocolError,
+    ):
+        # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
+        raise

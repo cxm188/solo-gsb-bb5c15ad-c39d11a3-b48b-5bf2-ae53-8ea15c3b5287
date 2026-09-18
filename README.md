@@ -1,7 +1,7 @@
 # IPv4 遮蔽分析 API
 
 基于 **Python + FastAPI** 的 IPv4 CIDR 规则遮蔽（shadowing）分析、等价性比较、
-包含层级分析与静态路由解析服务。
+包含层级分析、静态路由解析与**有状态防火墙模拟**服务。
 
 按输入顺序处理一组有序的 `allow` / `deny` CIDR 规则，计算每条规则
 **未被此前任何规则覆盖**的地址集合，并分为：
@@ -59,6 +59,18 @@ CIDR 变更（`cidr_changed`）与未变（`unchanged`），并在各自清单�
 **共享同一集合**并保持输入顺序；`summary` 给出整表承载地址数、不可达地址数
 （二者之和恒为 2³²）与逐条生效地址之和（ECMP 并行路由各计一次）。
 
+`POST /firewall/simulate` 是**有状态防火墙模拟**：给定有序五元组规则
+（源/目的 CIDR、协议 tcp/udp/icmp、目的端口范围、allow/deny）与一串**按时间
+非严格递增排序**的数据包事件，首个**正向**命中 allow 的包以其五元组建立会话；
+后续**反向包**（源/目的地址与端口整体交换、协议相同）在会话存活时间
+（`session_timeout`，默认 30 秒）内**跳过规则匹配自动放行**（`stateful`）；
+反向包到达时会话已超时则先清除过期会话（计入 `sessions_expired`）并**重新走
+规则匹配**，再次命中 allow 则按新方向重建会话。逐事件返回命中规则（或
+`stateful` / `default`）、最终动作、方向（forward/reverse）与会话状态
+（new/established/expired/none），`summary` 汇总放行、拒绝、新建、过期数量
+与结束时仍存活的会话数。时间逆序、非法端口、协议-端口组合错误与**重叠会话键**
+（为仍存活的五元组重复建会话）均返回 422。
+
 > 遮蔽来源不区分动作：先前的 **allow 与 deny 规则取并集**，共同遮蔽后续规则。
 
 ---
@@ -80,6 +92,7 @@ docker compose up --build -d
 - **路由解析接口：** `POST http://localhost:8000/routes/resolve`
 - **故障切换接口：** `POST http://localhost:8000/routes/failover`
 - **路由表审计接口：** `POST http://localhost:8000/routes/audit`
+- **有状态防火墙模拟接口：** `POST http://localhost:8000/firewall/simulate`
 - **交互式文档（Swagger UI）：** http://localhost:8000/docs
 - **OpenAPI Schema：** http://localhost:8000/openapi.json
 - **健康检查：** http://localhost:8000/health
@@ -1439,6 +1452,238 @@ curl -s http://localhost:8000/routes/audit \
   }'
 ```
 
+---
+
+### `POST /firewall/simulate`
+
+在**有序五元组规则**之上模拟有状态防火墙，逐事件给出裁决。
+
+#### 匹配与建会话规则
+
+1. **规则按数组顺序逐条匹配，首条命中生效**；均未命中时走 `default_action`。
+   命中条件：协议相同、源地址 ∈ `src_cidr`、目的地址 ∈ `dst_cidr`，tcp/udp
+   还要求**目的端口**落在 `[port_min, port_max]` 闭区间（源端口不参与匹配）。
+2. 首个**正向**命中 allow 规则的包以其五元组
+   `(protocol, src_ip, src_port, dst_ip, dst_port)` 建立会话，存活至
+   `created_at + session_timeout`（**该时刻仍存活**，严格大于才过期）。
+3. 后续**反向包**（源/目的地址与端口整体交换、协议相同）在存活期内**跳过
+   规则匹配自动放行**：`decision = "stateful"`、`action = "allow"`、
+   `direction = "reverse"`，并刷新会话的 `last_seen_at`（截止时间不滑动）。
+4. 反向包到达时会话**已超时**：先清除该过期会话（计入 `sessions_expired`，
+   挂到该事件的 `expired_sessions`），**重新走规则匹配**——再次命中 allow
+   则按当前方向重建会话（`session_state = "new"`），否则按命中规则 / 默认
+   动作裁决（`session_state = "expired"`）。
+5. 存活期间的**同方向（正向）包不享受状态化放行**，仍走规则匹配；若它再次
+   命中 allow 并试图为一个**仍存活**的同五元组建会话，则该请求存在
+   **重叠会话键**，返回 **422**（超时后的同五元组允许重建，旧会话被惰性
+   清除并计入 `sessions_expired`）。
+6. **只有显式命中 allow 规则才建立会话**：默认动作 allow 不建立会话，
+   deny 规则与默认 deny 同样不建立会话。
+
+> 会话过期计数是**惰性**的：只有事件实际碰到已过期的会话（反向复用或同方向
+> 重建）时才在该事件上清除并计数；请求结束时仍未再出现的会话不计入
+> `sessions_expired`，但会体现在最终的 `active_sessions`（按最后一个事件
+> 时间点判断存活）中。
+
+#### 请求体
+
+| 字段 | 说明 |
+| --- | --- |
+| `rules` | **0～500 条**有序规则（允许为空 `[]`，此时全部走默认动作） |
+| `rules[].action` | `allow` / `deny`（大小写不敏感） |
+| `rules[].src_cidr` / `.dst_cidr` | 源 / 目的 IPv4 CIDR，校验同其他接口（纯 IP 按 `/32`、主机位必须为零、禁止 IPv6） |
+| `rules[].protocol` | `tcp` / `udp` / `icmp`（大小写不敏感） |
+| `rules[].port_min` / `.port_max` | 目的端口闭区间，0～65535 整数且 `port_min ≤ port_max`；**icmp 必须为 `null`** |
+| `default_action` | **必填**，未命中任何规则时的动作（`allow` / `deny`，大小写不敏感） |
+| `events` | **1～2000 个**按时间非严格递增排序的数据包事件 |
+| `events[].time` | 非负整数时间戳（单位与 `session_timeout` 一致，API 约定为秒）；相等时间戳合法，逆序返回 422 |
+| `events[].src_ip` / `.dst_ip` | 严格 IPv4 地址（纯地址，禁止 CIDR 写法、前导零与 IPv6） |
+| `events[].src_port` / `.dst_port` | 0～65535 整数端口；**icmp 事件必须为 `null`**，tcp/udp 必须同时给出 |
+| `events[].protocol` | `tcp` / `udp` / `icmp`（大小写不敏感） |
+| `session_timeout` | 会话存活时间，1～86400 的正整数，**默认 30** |
+
+```json
+{
+  "rules": [
+    {"action": "allow", "src_cidr": "10.0.0.0/24", "dst_cidr": "10.0.1.0/24",
+     "protocol": "tcp", "port_min": 80, "port_max": 80},
+    {"action": "deny", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+     "protocol": "tcp", "port_min": 0, "port_max": 65535}
+  ],
+  "default_action": "deny",
+  "session_timeout": 30,
+  "events": [
+    {"time": 1,  "src_ip": "10.0.0.1", "src_port": 1234, "dst_ip": "10.0.1.1", "dst_port": 80,   "protocol": "tcp"},
+    {"time": 2,  "src_ip": "10.0.1.1", "src_port": 80,   "dst_ip": "10.0.0.1", "dst_port": 1234, "protocol": "tcp"},
+    {"time": 32, "src_ip": "10.0.1.1", "src_port": 80,   "dst_ip": "10.0.0.1", "dst_port": 1234, "protocol": "tcp"},
+    {"time": 40, "src_ip": "10.0.0.1", "src_port": 1234, "dst_ip": "10.0.1.1", "dst_port": 80,   "protocol": "tcp"}
+  ]
+}
+```
+
+#### 响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `rule_count` / `event_count` / `session_timeout` / `default_action` | 回显规范化后的请求参数 |
+| `results[]` | 逐事件裁决结果，**严格保持 events 输入顺序** |
+| `results[].decision` | `rule`（命中规则）/ `default`（走默认动作）/ `stateful`（存活会话反向包自动放行） |
+| `results[].rule_index` | 命中规则序号（stateful 反向包回填其建会话规则）；default 为 `null` |
+| `results[].action` | 最终动作 `allow` / `deny` |
+| `results[].direction` | `forward`（走规则/默认裁决）/ `reverse`（存活会话的反向包） |
+| `results[].session_state` | `new`（本事件新建会话）/ `established`（stateful 命中存活会话）/ `expired`（本事件清除了过期会话且未重建）/ `none` |
+| `results[].session` | 命中 / 新建的会话描述（`key` / `rule_index` / `created_at` / `last_seen_at` / `expires_at` / `age` / `established_by_event`）；拒绝或走默认动作时为 `null` |
+| `results[].expired_sessions` | 本事件惰性清除的过期会话（0～2 个），字段同上但无 `age` |
+| `summary.allow` / `.deny` | 最终放行 / 拒绝事件数（二者之和 = `event_count`，stateful 计入 allow） |
+| `summary.sessions_new` | 新建会话次数（含超时后重建） |
+| `summary.sessions_expired` | 被惰性清除的过期会话数 |
+| `summary.active_sessions` | 请求结束（最后一个事件时间）时仍存活的会话数 |
+
+#### 响应示例（200）
+
+上例中：t=1 正向命中规则 0 建会话（`expires_at=31`）；t=2 反向 stateful
+放行；t=32 反向包到达时会话已超时，清除后重新走规则匹配并被规则 1 拒绝
+（`session_state="expired"`）；t=40 正向再次命中 allow，重建会话：
+
+```json
+{
+  "rule_count": 2,
+  "event_count": 4,
+  "session_timeout": 30,
+  "default_action": "deny",
+  "results": [
+    {
+      "index": 0, "time": 1,
+      "src_ip": "10.0.0.1", "src_port": 1234,
+      "dst_ip": "10.0.1.1", "dst_port": 80, "protocol": "tcp",
+      "decision": "rule", "rule_index": 0, "action": "allow",
+      "direction": "forward", "session_state": "new",
+      "session": {
+        "key": "tcp 10.0.0.1:1234 -> 10.0.1.1:80",
+        "rule_index": 0, "created_at": 1, "last_seen_at": 1,
+        "expires_at": 31, "age": 0, "established_by_event": 0
+      },
+      "expired_sessions": []
+    },
+    {
+      "index": 1, "time": 2,
+      "src_ip": "10.0.1.1", "src_port": 80,
+      "dst_ip": "10.0.0.1", "dst_port": 1234, "protocol": "tcp",
+      "decision": "stateful", "rule_index": 0, "action": "allow",
+      "direction": "reverse", "session_state": "established",
+      "session": {
+        "key": "tcp 10.0.0.1:1234 -> 10.0.1.1:80",
+        "rule_index": 0, "created_at": 1, "last_seen_at": 2,
+        "expires_at": 31, "age": 1, "established_by_event": 0
+      },
+      "expired_sessions": []
+    },
+    {
+      "index": 2, "time": 32,
+      "src_ip": "10.0.1.1", "src_port": 80,
+      "dst_ip": "10.0.0.1", "dst_port": 1234, "protocol": "tcp",
+      "decision": "rule", "rule_index": 1, "action": "deny",
+      "direction": "forward", "session_state": "expired",
+      "session": null,
+      "expired_sessions": [
+        {
+          "key": "tcp 10.0.0.1:1234 -> 10.0.1.1:80",
+          "rule_index": 0, "created_at": 1, "last_seen_at": 2,
+          "expires_at": 31, "established_by_event": 0
+        }
+      ]
+    },
+    {
+      "index": 3, "time": 40,
+      "src_ip": "10.0.0.1", "src_port": 1234,
+      "dst_ip": "10.0.1.1", "dst_port": 80, "protocol": "tcp",
+      "decision": "rule", "rule_index": 0, "action": "allow",
+      "direction": "forward", "session_state": "new",
+      "session": {
+        "key": "tcp 10.0.0.1:1234 -> 10.0.1.1:80",
+        "rule_index": 0, "created_at": 40, "last_seen_at": 40,
+        "expires_at": 70, "age": 0, "established_by_event": 3
+      },
+      "expired_sessions": []
+    }
+  ],
+  "summary": {
+    "allow": 3,
+    "deny": 1,
+    "sessions_new": 2,
+    "sessions_expired": 1,
+    "active_sessions": 1
+  }
+}
+```
+
+icmp 规则 / 事件省略端口（`port_min`、`port_max`、`src_port`、`dst_port`
+均为 `null`），会话键形如 `icmp 10.0.0.1 -> 10.0.1.9`，反向 stateful 语义
+完全相同。
+
+#### 错误示例（422，时间逆序）
+
+事件时间必须**非严格递增**；逆序时一次性列出**全部**逆序位置（相等时间戳
+合法）：
+
+```json
+{
+  "detail": {
+    "error": "time_out_of_order",
+    "violations": [
+      {"index": 1, "time": 5, "previous_index": 0, "previous_time": 10},
+      {"index": 3, "time": 4, "previous_index": 2, "previous_time": 5}
+    ]
+  }
+}
+```
+
+#### 错误示例（422，重叠会话键）
+
+存活期内同方向包再次命中 allow、试图为**仍存活**的同五元组重复建会话时
+返回 422（超时后重建合法），冲突中给出事件序号、五元组与仍存活的旧会话，
+且**不产生部分结果**：
+
+```json
+{
+  "detail": {
+    "error": "duplicate_session_key",
+    "conflicts": [
+      {
+        "index": 1,
+        "key": "tcp 10.0.0.1:1234 -> 10.0.1.1:80",
+        "rule_index": 0,
+        "existing": {
+          "rule_index": 0,
+          "created_at": 1,
+          "last_seen_at": 1,
+          "established_by_event": 0
+        }
+      }
+    ]
+  }
+}
+```
+
+#### curl 示例
+
+```bash
+curl -s http://localhost:8000/firewall/simulate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rules": [
+      {"action":"allow","src_cidr":"10.0.0.0/24","dst_cidr":"10.0.1.0/24","protocol":"tcp","port_min":80,"port_max":80},
+      {"action":"deny","src_cidr":"0.0.0.0/0","dst_cidr":"0.0.0.0/0","protocol":"tcp","port_min":0,"port_max":65535}
+    ],
+    "default_action":"deny",
+    "session_timeout":30,
+    "events":[
+      {"time":1,"src_ip":"10.0.0.1","src_port":1234,"dst_ip":"10.0.1.1","dst_port":80,"protocol":"tcp"},
+      {"time":2,"src_ip":"10.0.1.1","src_port":80,"dst_ip":"10.0.0.1","dst_port":1234,"protocol":"tcp"}
+    ]
+  }'
+```
+
 ### 错误响应（422 Unprocessable Entity）
 
 以下输入均返回 HTTP `422`，错误明细位于 `detail`：
@@ -1466,6 +1711,19 @@ curl -s http://localhost:8000/routes/audit \
 - `/routes/audit` 缺少 `routes`、路由数超过 1000、`routes` 不是数组，或
   路由条目的 `cidr` / `next_hop` / `metric` 未通过与 `/routes/resolve`
   相同的严格 IPv4 / 整数校验（允许为空数组 `[]`，此时整表不可达）
+- `/firewall/simulate` 的下列输入均返回 422：
+  - **时间逆序**：事件 `time` 不是非严格递增（相等时间戳合法），明细在
+    `detail.violations` 中一次性列出全部逆序位置（`index` / `time` /
+    `previous_index` / `previous_time`）；负时间戳、非整数时间同属 422；
+  - **非法端口 / 协议组合**：端口不是 0～65535 的整数、规则
+    `port_min > port_max`、icmp 规则或事件携带端口、tcp/udp 缺少任一端口、
+    `protocol` 不是 `tcp` / `udp` / `icmp`；
+  - **重叠会话键**：事件试图为一个**仍存活**的同五元组重复建立会话，明细在
+    `detail.conflicts`（`index` / `key` / `rule_index` / `existing`），
+    不产生部分结果；超时后重建合法；
+  - `events` 为空或超过 2000、`rules` 超过 500、`session_timeout` 不在
+    1～86400、缺少 `default_action` / `events`；
+  - CIDR / 地址沿用其他接口的严格 IPv4 校验（CIDR 写法、前导零、IPv6 等）。
 - 非法 CIDR：格式错误、前缀越界（`/33`）、主机位非零（`10.0.0.1/8`）等
 - IPv6 地址或网段：`2001:db8::/32`、`::1` 等
 - 非法 / 缺失 `action` 或 `default_action`、字段类型错误、JSON 格式错误
@@ -1506,6 +1764,14 @@ ecmp_reduced / rerouted / unreachable）、回退到更高 metric 与更短前�
 metric、同网段高 metric 遮蔽、同 metric 并行路由共享集合且保持输入顺序、
 被更长前缀无缝完全覆盖、多层嵌套不重不漏、默认路由全空间补集、空表整表
 不可达、承载/不可达/逐条生效之和等汇总不变量、422 与数量边界，
+`/firewall/simulate` 的首条规则匹配（源/目的 CIDR、协议、目的端口闭区间、
+源端口不参与）、正向 allow 建会话与存活边界（`created_at + timeout` 时刻
+仍存活）、反向 stateful 放行与 `last_seen_at` 刷新、反向超时后重新走规则
+匹配（再 allow 重建 / 再 deny 标记 expired）、同方向存活期不享受状态化、
+同五元组超时惰性清除与重建、默认 allow 不建会话、icmp 无端口会话键、
+相等时间戳合法与全部逆序位置一次性报告、非法端口 / 协议组合 / 重叠会话键
+422、数量与 `session_timeout` 边界、allow + deny = event_count 等汇总
+不变量，
 以及用标准库 `ipaddress.collapse_addresses` 作为 oracle
 的随机属性测试（无损 + 最少块，并与逐地址暴力判定/逐路由暴力 LPM 对比；
 failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证；
@@ -1521,10 +1787,12 @@ audit 与逐地址暴力“最长前缀 + 最低 metric + ECMP”oracle 交叉�
 │   ├── __init__.py
 │   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析、等价比较、裁决归因、包含层级与网段清单差异
 │   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析、下一跳故障切换与整表空间审计
-│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/cidrs/diff、/routes/resolve、/routes/failover、/routes/audit 接口
+│   ├── firewall.py    # 核心：有序五元组规则匹配、有状态会话建立/反向 stateful 放行/惰性超时清除与重建
+│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/cidrs/diff、/routes/resolve、/routes/failover、/routes/audit、/firewall/simulate 接口
 ├── tests/
 │   ├── test_analyzer.py
 │   ├── test_router.py
+│   ├── test_firewall.py
 │   └── test_api.py
 ├── Dockerfile
 ├── docker-compose.yml
@@ -1586,5 +1854,14 @@ audit 与逐地址暴力“最长前缀 + 最低 metric + ECMP”oracle 交叉�
   承载地址数由所有网段生效碎片再做一次并集合并得到（ECMP 与嵌套都不重复
   计数），其补集即不可达地址数。复杂度为 O(网段数²) 的区间运算，
   不逐地址枚举。
+- **有状态防火墙**：`/firewall/simulate` 把规则预解析为整数区间 + 端口范围，
+  按事件时间顺序逐包处理。会话以**正向有向五元组**为键保存（icmp 省略端口），
+  事件先查“反向五元组”：存活（`time ≤ created_at + session_timeout`）则
+  stateful 放行并刷新 `last_seen_at`；已过期则从会话表惰性删除（计入
+  `sessions_expired`）后继续走规则匹配。正向包严格按有序规则首条匹配，
+  仅命中 **allow 规则**时建会话（默认 allow 不建）：同五元组旧会话仍存活
+  即一次性抛出重叠会话键错误，已过期则先计数清除再以新规则重建。最终
+  `active_sessions` 按最后一个事件时间点统一判定。时间逆序在模拟开始前
+  一次性收集全部逆序位置，不产生部分结果。
 - **整数运算**：全部基于 32 位无符号整数区间处理，避免字符串/对象开销，
   可正确支持 `0.0.0.0/0` 全空间等边界场景。
