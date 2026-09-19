@@ -1526,3 +1526,356 @@ def test_audit_existing_endpoints_unchanged():
     )
     assert resp.status_code == 200
     assert post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}]).status_code == 200
+
+
+# ---------- /firewall/simulate ----------
+
+
+def post_firewall(rules, events, default_action="deny", session_timeout=30):
+    return client.post(
+        "/firewall/simulate",
+        json={
+            "rules": rules,
+            "events": events,
+            "default_action": default_action,
+            "session_timeout": session_timeout,
+        },
+    )
+
+
+FW_ALLOW_WEB = {
+    "action": "allow",
+    "src_cidr": "10.0.0.0/24",
+    "dst_cidr": "10.0.1.0/24",
+    "protocol": "tcp",
+    "port_start": 80,
+    "port_end": 80,
+}
+FW_DENY_OTHERS = {
+    "action": "deny",
+    "src_cidr": "0.0.0.0/0",
+    "dst_cidr": "0.0.0.0/0",
+    "protocol": "tcp",
+    "port_start": 0,
+    "port_end": 65535,
+}
+
+
+def fw_event(timestamp, src, sport, dst, dport, proto="tcp", direction="forward"):
+    return {
+        "timestamp": timestamp,
+        "src_ip": src,
+        "dst_ip": dst,
+        "protocol": proto,
+        "src_port": sport,
+        "dst_port": dport,
+        "direction": direction,
+    }
+
+
+def test_firewall_stateful_lifecycle_and_summary():
+    events = [
+        fw_event(0, "10.0.0.10", 40000, "10.0.1.20", 80),
+        fw_event(5, "10.0.1.20", 80, "10.0.0.10", 40000, direction="reverse"),
+        fw_event(30, "10.0.1.20", 80, "10.0.0.10", 40000, direction="reverse"),
+        fw_event(31, "10.0.1.20", 80, "10.0.0.10", 40000, direction="reverse"),
+        fw_event(50, "10.0.0.10", 40000, "10.0.1.20", 80),
+    ]
+    resp = post_firewall([FW_ALLOW_WEB, FW_DENY_OTHERS], events)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["rule_count"] == 2
+    assert body["event_count"] == 5
+    assert body["default_action"] == "deny"
+    assert body["session_timeout"] == 30
+
+    results = body["results"]
+    assert [r["index"] for r in results] == [0, 1, 2, 3, 4]
+    assert [r["session_state"] for r in results] == [
+        "new",                 # 正向 allow 建会话
+        "active",              # 反向 stateful
+        "active",              # 边界时刻 expires_at==30 仍存活
+        "expired",             # 31 > 30，过期后重新走规则命中 deny
+        "expired_reestablished",  # 过期后正向 allow 重建
+    ]
+    assert [r["action"] for r in results] == [
+        "allow", "allow", "allow", "deny", "allow"
+    ]
+    assert [r["match"]["type"] for r in results] == [
+        "rule", "stateful", "stateful", "rule", "rule"
+    ]
+    assert results[0]["match"]["rule_index"] == 0
+    assert results[1]["match"]["rule_index"] is None
+    assert results[3]["match"]["rule_index"] == 1  # deny 兜底规则
+
+    # stateful 放行携带正向会话键（src/dst 与反向包相反）
+    session = results[1]["session"]
+    assert session["key"] == {
+        "protocol": "tcp",
+        "src_ip": "10.0.0.10",
+        "dst_ip": "10.0.1.20",
+        "src_port": 40000,
+        "dst_port": 80,
+    }
+    assert session["created_at"] == 0
+    assert session["expires_at"] == 30
+    assert session["rule_index"] == 0
+    assert session["established_by_event"] == 0
+
+    assert results[3]["session"]["expires_at"] == 30  # expired 带原会话
+    assert results[4]["session"]["created_at"] == 50
+    assert results[4]["session"]["expires_at"] == 80
+
+    assert body["summary"] == {
+        "allowed": 4,
+        "denied": 1,
+        "new_sessions": 2,
+        "expired_sessions": 1,
+        "active_sessions": 1,
+    }
+
+
+def test_firewall_denied_forward_no_session_and_reverse_denied():
+    events = [
+        fw_event(0, "8.8.8.8", 1000, "10.0.1.20", 22),
+        fw_event(1, "10.0.1.20", 22, "8.8.8.8", 1000, direction="reverse"),
+    ]
+    resp = post_firewall([FW_ALLOW_WEB, FW_DENY_OTHERS], events)
+    assert resp.status_code == 200
+    results = resp.json()["results"]
+    assert [r["action"] for r in results] == ["deny", "deny"]
+    assert [r["match"]["type"] for r in results] == ["rule", "rule"]
+    assert [r["session_state"] for r in results] == ["none", "none"]
+    assert all(r["session"] is None for r in results)
+    assert resp.json()["summary"] == {
+        "allowed": 0,
+        "denied": 2,
+        "new_sessions": 0,
+        "expired_sessions": 0,
+        "active_sessions": 0,
+    }
+
+
+def test_firewall_default_action_used_and_case_insensitive():
+    events = [fw_event(0, "8.8.8.8", 1000, "9.9.9.9", 443)]
+    resp = post_firewall([], events, default_action="ALLOW")
+    assert resp.status_code == 200
+    item = resp.json()["results"][0]
+    assert item["match"] == {"type": "default", "rule_index": None}
+    assert item["action"] == "allow"
+    assert item["session_state"] == "new"
+
+
+def test_firewall_first_matching_rule_wins_and_port_range():
+    rules = [
+        {"action": "deny", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+         "protocol": "tcp", "port_start": 0, "port_end": 65535},
+        {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+         "protocol": "tcp", "port_start": 80, "port_end": 80},
+    ]
+    events = [
+        fw_event(0, "1.1.1.1", 1000, "2.2.2.2", 80),
+    ]
+    resp = post_firewall(rules, events)
+    item = resp.json()["results"][0]
+    assert item["match"]["rule_index"] == 0  # 首条 deny 先生效
+    assert item["action"] == "deny"
+
+
+def test_firewall_icmp_no_ports():
+    rules = [
+        {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+         "protocol": "icmp", "port_start": None, "port_end": None},
+    ]
+    events = [
+        fw_event(0, "1.1.1.1", None, "2.2.2.2", None, proto="icmp"),
+        fw_event(1, "2.2.2.2", None, "1.1.1.1", None, proto="icmp", direction="reverse"),
+    ]
+    resp = post_firewall(rules, events)
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert [r["session_state"] for r in results] == ["new", "active"]
+    key = results[0]["session"]["key"]
+    assert key["protocol"] == "icmp"
+    assert key["src_port"] is None and key["dst_port"] is None
+    assert results[0]["src_port"] is None and results[0]["dst_port"] is None
+
+
+def test_firewall_out_of_order_timestamps_422():
+    events = [
+        fw_event(10, "1.1.1.1", 1000, "2.2.2.2", 80),
+        fw_event(5, "1.1.1.1", 1000, "2.2.2.2", 80),
+        fw_event(8, "1.1.1.1", 1000, "2.2.2.2", 80),
+    ]
+    resp = post_firewall([FW_ALLOW_WEB], events)
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {
+        "error": "out_of_order_timestamps",
+        "violations": [
+            {"index": 1, "timestamp": 5, "previous_timestamp": 10},
+        ],
+    }
+
+
+def test_firewall_overlapping_reverse_session_422():
+    events = [
+        fw_event(0, "1.1.1.1", 1000, "2.2.2.2", 80),
+        fw_event(2, "2.2.2.2", 80, "1.1.1.1", 1000),
+    ]
+    rules = [
+        {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+         "protocol": "tcp", "port_start": 0, "port_end": 65535},
+    ]
+    resp = post_firewall(rules, events)
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {
+        "error": "overlapping_session",
+        "index": 1,
+        "conflict": "reverse_key_collision",
+        "existing_index": 0,
+        "session_key": {
+            "protocol": "tcp",
+            "src_ip": "2.2.2.2",
+            "src_port": 80,
+            "dst_ip": "1.1.1.1",
+            "dst_port": 1000,
+        },
+    }
+
+
+def test_firewall_reverse_after_expiry_may_start_new_forward_session():
+    # 过期后不存在重叠：反向流作为新的 forward 发起方可建立新会话
+    rules = [
+        {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+         "protocol": "tcp", "port_start": 0, "port_end": 65535},
+    ]
+    events = [
+        fw_event(0, "1.1.1.1", 1000, "2.2.2.2", 80),
+        fw_event(40, "2.2.2.2", 80, "1.1.1.1", 1000),
+    ]
+    resp = post_firewall(rules, events, session_timeout=30)
+    assert resp.status_code == 200
+    assert [r["session_state"] for r in resp.json()["results"]] == ["new", "new"]
+
+
+def test_firewall_validation_422():
+    valid_event = fw_event(0, "1.1.1.1", 1000, "2.2.2.2", 80)
+    valid_rule = FW_ALLOW_WEB
+
+    # 缺少字段 / 空请求体
+    assert client.post("/firewall/simulate", json={}).status_code == 422
+    assert client.post(
+        "/firewall/simulate",
+        json={"rules": [], "events": [valid_event], "default_action": "deny"},
+    ).status_code == 422  # 缺 session_timeout
+    assert client.post(
+        "/firewall/simulate",
+        json={"rules": [], "events": [valid_event], "session_timeout": 30},
+    ).status_code == 422  # 缺 default_action
+
+    # 空事件 / 超过 2000 个事件
+    assert post_firewall([valid_rule], []).status_code == 422
+    too_many = [
+        fw_event(i, f"1.0.{i // 256}", 1000 + i % 50000, "2.2.2.2", 80)
+        for i in range(2001)
+    ]
+    assert post_firewall([valid_rule], too_many).status_code == 422
+
+    # 超过 500 条规则
+    too_many_rules = [
+        {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+         "protocol": "tcp", "port_start": 0, "port_end": 65535}
+        for _ in range(501)
+    ]
+    assert post_firewall(too_many_rules, [valid_event]).status_code == 422
+
+    # 非法端口：越界 / bool / float / 字符串
+    for bad_port in [-1, 65536, True, 1.5, "80"]:
+        bad = fw_event(0, "1.1.1.1", bad_port, "2.2.2.2", 80)
+        assert post_firewall([valid_rule], [bad]).status_code == 422, bad_port
+    bad_rule = {**valid_rule, "port_start": 100, "port_end": 80}
+    assert post_firewall([bad_rule], [valid_event]).status_code == 422
+
+    # icmp 带端口 / tcp 缺端口
+    assert post_firewall(
+        [{"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+          "protocol": "icmp", "port_start": 0, "port_end": 0}],
+        [fw_event(0, "1.1.1.1", None, "2.2.2.2", None, proto="icmp")],
+    ).status_code == 422
+    assert post_firewall(
+        [valid_rule],
+        [fw_event(0, "1.1.1.1", None, "2.2.2.2", 80)],
+    ).status_code == 422
+
+    # 非法时间戳：负数 / bool / float
+    for bad_ts in [-1, True, 1.5]:
+        assert post_firewall(
+            [valid_rule], [fw_event(bad_ts, "1.1.1.1", 1000, "2.2.2.2", 80)]
+        ).status_code == 422, bad_ts
+
+    # 非法 session_timeout：0 / 86401 / bool / float
+    for bad_timeout in [0, 86401, True, 1.5, "30"]:
+        resp = client.post(
+            "/firewall/simulate",
+            json={"rules": [], "events": [valid_event],
+                  "default_action": "deny", "session_timeout": bad_timeout},
+        )
+        assert resp.status_code == 422, bad_timeout
+
+    # 非法协议 / 方向 / 动作 / CIDR / 地址
+    assert post_firewall(
+        [{"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+          "protocol": "gre", "port_start": 0, "port_end": 0}],
+        [valid_event],
+    ).status_code == 422
+    assert post_firewall(
+        [valid_rule],
+        [fw_event(0, "1.1.1.1", 1000, "2.2.2.2", 80, direction="inbound")],
+    ).status_code == 422
+    assert post_firewall(
+        [{**valid_rule, "action": "permit"}], [valid_event]
+    ).status_code == 422
+    assert post_firewall(
+        [{**valid_rule, "src_cidr": "10.0.0.0/33"}], [valid_event]
+    ).status_code == 422
+    assert post_firewall(
+        [valid_rule], [fw_event(0, "1.1.1.1/32", 1000, "2.2.2.2", 80)]
+    ).status_code == 422
+    assert post_firewall(
+        [valid_rule],
+        [fw_event(0, "2001:db8::1", 1000, "2.2.2.2", 80)],
+    ).status_code == 422
+
+
+def test_firewall_openapi_documented():
+    spec = client.get("/openapi.json").json()
+    assert "/firewall/simulate" in spec["paths"]
+    operation = spec["paths"]["/firewall/simulate"]["post"]
+    assert operation["tags"] == ["firewall"]
+    assert operation["summary"]
+    for name in (
+        "FirewallSimulateRequest",
+        "FirewallSimulateResponse",
+        "FirewallRule",
+        "FirewallEvent",
+        "FirewallEventResult",
+        "FirewallSummary",
+        "FirewallSession",
+        "FirewallSessionKey",
+    ):
+        assert name in spec["components"]["schemas"], name
+    # 内置 422 错误示例
+    examples = operation["responses"]["422"]["content"]["application/json"]["examples"]
+    assert set(examples) == {"out_of_order", "overlapping"}
+    # 请求示例
+    req_examples = operation["requestBody"]["content"]["application/json"]["examples"]
+    assert "simulate" in req_examples
+
+
+def test_firewall_existing_endpoints_unchanged():
+    # 新接口不影响既有接口
+    assert client.get("/health").status_code == 200
+    assert client.get("/").status_code == 200
+    assert post_audit([]).status_code == 200
+    assert post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}]).status_code == 200
